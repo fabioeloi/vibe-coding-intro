@@ -477,3 +477,440 @@ pub fn get_stats(conn: &DatabaseConnection) -> Result<HistoryStats> {
         })
     })
 }
+
+/// Parameters for timeline data visualization
+pub struct TimelineParams {
+    /// Start date for timeline data
+    pub start_date: Option<DateTime<Utc>>,
+    /// End date for timeline data
+    pub end_date: Option<DateTime<Utc>>,
+    /// Optional domain filter
+    pub domain: Option<String>,
+    /// How to group the timeline data
+    pub group_by: TimelineGrouping,
+}
+
+/// Grouping type for timeline visualization
+pub enum TimelineGrouping {
+    /// Group by hour of day
+    Hour,
+    /// Group by day
+    Day,
+    /// Group by domain
+    Domain,
+}
+
+/// Timeline data item, variant depends on grouping type
+pub enum TimelineItem {
+    /// Hourly grouping item
+    Hourly {
+        /// Hour of day (0-23)
+        hour: u8,
+        /// Number of visits in this hour
+        count: u32,
+        /// Timestamp for this hour (for display purposes)
+        timestamp: DateTime<Utc>,
+        /// Optional sample of URLs visited in this hour
+        urls: Option<Vec<crate::db::models::UrlWithVisits>>,
+    },
+    /// Daily grouping item
+    Daily {
+        /// Date for this day
+        date: DateTime<Utc>,
+        /// Number of visits on this day
+        count: u32,
+        /// Optional sample of URLs visited on this day
+        urls: Option<Vec<crate::db::models::UrlWithVisits>>,
+    },
+    /// Domain grouping item
+    Domain {
+        /// Domain name
+        domain: String,
+        /// Number of visits to this domain
+        count: u32,
+        /// Optional sample of URLs for this domain
+        urls: Option<Vec<crate::db::models::UrlWithVisits>>,
+    },
+}
+
+/// Gets timeline data based on the given parameters
+pub fn get_timeline_data(
+    conn: &DatabaseConnection,
+    params: &TimelineParams,
+) -> Result<Vec<TimelineItem>> {
+    // Use existing connection to perform query
+    conn.use_connection(|c| match params.group_by {
+        TimelineGrouping::Hour => get_hourly_timeline_data(c, params),
+        TimelineGrouping::Day => get_daily_timeline_data(c, params),
+        TimelineGrouping::Domain => get_domain_timeline_data(c, params),
+    })
+}
+
+/// Gets timeline data grouped by hour of day
+fn get_hourly_timeline_data(
+    conn: &Connection,
+    params: &TimelineParams,
+) -> Result<Vec<TimelineItem>> {
+    // Build query to group visits by hour of day
+    let mut query = String::from(
+        "SELECT 
+            strftime('%H', datetime(visited_at, 'unixepoch')) as hour,
+            COUNT(*) as count,
+            MIN(visited_at) as sample_timestamp
+         FROM visit
+         JOIN url ON visit.url_id = url.id"
+    );
+    
+    // Add WHERE clauses for filters
+    let mut conditions = Vec::new();
+    let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    
+    if let Some(ref start_date) = params.start_date {
+        conditions.push("visited_at >= ?");
+        query_params.push(Box::new(start_date.timestamp()));
+    }
+    
+    if let Some(ref end_date) = params.end_date {
+        conditions.push("visited_at <= ?");
+        query_params.push(Box::new(end_date.timestamp()));
+    }
+    
+    if let Some(ref domain) = params.domain {
+        conditions.push("url.domain = ?");
+        query_params.push(Box::new(domain.clone()));
+    }
+    
+    if !conditions.is_empty() {
+        query.push_str(" WHERE ");
+        query.push_str(&conditions.join(" AND "));
+    }
+    
+    // Group by hour and order by visit count
+    query.push_str(" GROUP BY hour ORDER BY count DESC, hour ASC");
+    
+    // Execute query
+    let mut stmt = conn.prepare(&query)?;
+    
+    let results = stmt.query_map(rusqlite::params_from_iter(query_params.iter().map(|p| p.as_ref())), |row| {
+        let hour_str: String = row.get(0)?;
+        let count: u32 = row.get(1)?;
+        let timestamp: i64 = row.get(2)?;
+        
+        // Parse hour
+        let hour: u8 = hour_str.parse().unwrap_or(0);
+        
+        // Create timestamp for display
+        let timestamp = DateTime::from_timestamp(timestamp, 0)
+            .unwrap_or_else(|| Utc::now());
+        
+        Ok(TimelineItem::Hourly {
+            hour,
+            count,
+            timestamp,
+            urls: None, // We'll fill this in separately
+        })
+    })?;
+    
+    let mut timeline_items = Vec::new();
+    for result in results {
+        timeline_items.push(result?);
+    }
+    
+    // Fetch sample URLs for each hour (if timeline items exist)
+    if !timeline_items.is_empty() {
+        fetch_sample_urls_for_timeline(&mut timeline_items, conn, params)?;
+    }
+    
+    Ok(timeline_items)
+}
+
+/// Gets timeline data grouped by day
+fn get_daily_timeline_data(
+    conn: &Connection,
+    params: &TimelineParams,
+) -> Result<Vec<TimelineItem>> {
+    // Build query to group visits by day
+    let mut query = String::from(
+        "SELECT 
+            strftime('%Y-%m-%d', datetime(visited_at, 'unixepoch')) as day,
+            COUNT(*) as count,
+            MIN(visited_at) as sample_timestamp
+         FROM visit
+         JOIN url ON visit.url_id = url.id"
+    );
+    
+    // Add WHERE clauses for filters
+    let mut conditions = Vec::new();
+    let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    
+    if let Some(ref start_date) = params.start_date {
+        conditions.push("visited_at >= ?");
+        query_params.push(Box::new(start_date.timestamp()));
+    }
+    
+    if let Some(ref end_date) = params.end_date {
+        conditions.push("visited_at <= ?");
+        query_params.push(Box::new(end_date.timestamp()));
+    }
+    
+    if let Some(ref domain) = params.domain {
+        conditions.push("url.domain = ?");
+        query_params.push(Box::new(domain.clone()));
+    }
+    
+    if !conditions.is_empty() {
+        query.push_str(" WHERE ");
+        query.push_str(&conditions.join(" AND "));
+    }
+    
+    // Group by day and order by date (newest first)
+    query.push_str(" GROUP BY day ORDER BY day DESC");
+    
+    // Execute query
+    let mut stmt = conn.prepare(&query)?;
+    
+    let results = stmt.query_map(rusqlite::params_from_iter(query_params.iter().map(|p| p.as_ref())), |row| {
+        let _day_str: String = row.get(0)?;
+        let count: u32 = row.get(1)?;
+        let timestamp: i64 = row.get(2)?;
+        
+        // Create date for this day
+        let date = DateTime::from_timestamp(timestamp, 0)
+            .unwrap_or_else(|| Utc::now());
+        
+        Ok(TimelineItem::Daily {
+            date,
+            count,
+            urls: None, // We'll fill this in separately
+        })
+    })?;
+    
+    let mut timeline_items = Vec::new();
+    for result in results {
+        timeline_items.push(result?);
+    }
+    
+    // Fetch sample URLs for each day (if timeline items exist)
+    if !timeline_items.is_empty() {
+        fetch_sample_urls_for_timeline(&mut timeline_items, conn, params)?;
+    }
+    
+    Ok(timeline_items)
+}
+
+/// Gets timeline data grouped by domain
+fn get_domain_timeline_data(
+    conn: &Connection,
+    params: &TimelineParams,
+) -> Result<Vec<TimelineItem>> {
+    // Build query to group visits by domain
+    let mut query = String::from(
+        "SELECT 
+            url.domain,
+            COUNT(*) as count
+         FROM visit
+         JOIN url ON visit.url_id = url.id"
+    );
+    
+    // Add WHERE clauses for filters
+    let mut conditions = Vec::new();
+    let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    
+    if let Some(ref start_date) = params.start_date {
+        conditions.push("visited_at >= ?");
+        query_params.push(Box::new(start_date.timestamp()));
+    }
+    
+    if let Some(ref end_date) = params.end_date {
+        conditions.push("visited_at <= ?");
+        query_params.push(Box::new(end_date.timestamp()));
+    }
+    
+    if let Some(ref domain) = params.domain {
+        conditions.push("url.domain = ?");
+        query_params.push(Box::new(domain.clone()));
+    }
+    
+    if !conditions.is_empty() {
+        query.push_str(" WHERE ");
+        query.push_str(&conditions.join(" AND "));
+    }
+    
+    // Group by domain and order by visit count
+    query.push_str(" GROUP BY url.domain ORDER BY count DESC LIMIT 100");
+    
+    // Execute query
+    let mut stmt = conn.prepare(&query)?;
+    
+    let results = stmt.query_map(rusqlite::params_from_iter(query_params.iter().map(|p| p.as_ref())), |row| {
+        let domain: String = row.get(0)?;
+        let count: u32 = row.get(1)?;
+        
+        Ok(TimelineItem::Domain {
+            domain,
+            count,
+            urls: None, // We'll fill this in separately
+        })
+    })?;
+    
+    let mut timeline_items = Vec::new();
+    for result in results {
+        timeline_items.push(result?);
+    }
+    
+    // Fetch sample URLs for each domain (if timeline items exist)
+    if !timeline_items.is_empty() {
+        fetch_sample_urls_for_timeline(&mut timeline_items, conn, params)?;
+    }
+    
+    Ok(timeline_items)
+}
+
+/// Helper function to fetch sample URLs for timeline items
+fn fetch_sample_urls_for_timeline(
+    timeline_items: &mut Vec<TimelineItem>,
+    conn: &Connection,
+    params: &TimelineParams,
+) -> Result<()> {
+    // For each timeline item, fetch a sample of URLs
+    for item in timeline_items.iter_mut() {
+        match item {
+            TimelineItem::Hourly { hour, timestamp, urls, .. } => {
+                // Fetch sample URLs for this hour
+                let mut query = String::from(
+                    "SELECT url.id, url.url, url.title, url.domain, 
+                     COUNT(visit.id) as visit_count,
+                     MAX(visit.visited_at) as last_visit
+                     FROM visit
+                     JOIN url ON visit.url_id = url.id
+                     WHERE strftime('%H', datetime(visited_at, 'unixepoch')) = ?"
+                );
+                
+                let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                query_params.push(Box::new(format!("{:02}", hour)));
+                
+                if let Some(ref start_date) = params.start_date {
+                    query.push_str(" AND visited_at >= ?");
+                    query_params.push(Box::new(start_date.timestamp()));
+                }
+                
+                if let Some(ref end_date) = params.end_date {
+                    query.push_str(" AND visited_at <= ?");
+                    query_params.push(Box::new(end_date.timestamp()));
+                }
+                
+                if let Some(ref domain) = params.domain {
+                    query.push_str(" AND url.domain = ?");
+                    query_params.push(Box::new(domain.clone()));
+                }
+                
+                query.push_str(" GROUP BY url.id ORDER BY visit_count DESC LIMIT 5");
+                
+                *urls = Some(fetch_urls_with_query(conn, &query, &query_params)?);
+            },
+            TimelineItem::Daily { date, urls, .. } => {
+                // Extract day string from the date
+                let day_str = date.format("%Y-%m-%d").to_string();
+                
+                // Fetch sample URLs for this day
+                let mut query = String::from(
+                    "SELECT url.id, url.url, url.title, url.domain, 
+                     COUNT(visit.id) as visit_count,
+                     MAX(visit.visited_at) as last_visit
+                     FROM visit
+                     JOIN url ON visit.url_id = url.id
+                     WHERE strftime('%Y-%m-%d', datetime(visited_at, 'unixepoch')) = ?"
+                );
+                
+                let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                query_params.push(Box::new(day_str));
+                
+                if let Some(ref domain) = params.domain {
+                    query.push_str(" AND url.domain = ?");
+                    query_params.push(Box::new(domain.clone()));
+                }
+                
+                query.push_str(" GROUP BY url.id ORDER BY visit_count DESC LIMIT 5");
+                
+                *urls = Some(fetch_urls_with_query(conn, &query, &query_params)?);
+            },
+            TimelineItem::Domain { domain, urls, .. } => {
+                // Fetch sample URLs for this domain
+                let mut query = String::from(
+                    "SELECT url.id, url.url, url.title, url.domain, 
+                     COUNT(visit.id) as visit_count,
+                     MAX(visit.visited_at) as last_visit
+                     FROM visit
+                     JOIN url ON visit.url_id = url.id
+                     WHERE url.domain = ?"
+                );
+                
+                let mut query_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                query_params.push(Box::new(domain.clone()));
+                
+                if let Some(ref start_date) = params.start_date {
+                    query.push_str(" AND visited_at >= ?");
+                    query_params.push(Box::new(start_date.timestamp()));
+                }
+                
+                if let Some(ref end_date) = params.end_date {
+                    query.push_str(" AND visited_at <= ?");
+                    query_params.push(Box::new(end_date.timestamp()));
+                }
+                
+                query.push_str(" GROUP BY url.id ORDER BY visit_count DESC LIMIT 5");
+                
+                *urls = Some(fetch_urls_with_query(conn, &query, &query_params)?);
+            },
+        }
+    }
+    
+    Ok(())
+}
+
+/// Helper function to fetch URLs with a given query
+fn fetch_urls_with_query(
+    conn: &Connection,
+    query: &str,
+    params: &[Box<dyn rusqlite::ToSql>],
+) -> Result<Vec<crate::db::models::UrlWithVisits>> {
+    let mut stmt = conn.prepare(query)?;
+    
+    let url_iter = stmt.query_map(rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())), |row| {
+        let id_str: String = row.get(0)?;
+        let url: String = row.get(1)?;
+        let title: Option<String> = row.get(2)?;
+        let domain: String = row.get(3)?;
+        let visit_count: i32 = row.get(4)?;
+        let last_visit_ts: Option<i64> = row.get(5)?;
+        
+        // Parse UUID from string
+        let id = Uuid::parse_str(&id_str)
+            .map_err(|e| rusqlite::Error::InvalidColumnType(0, format!("Invalid UUID: {}", e)))?;
+        
+        // Convert timestamp to DateTime if available
+        let last_visit = last_visit_ts.map(|ts| {
+            DateTime::from_timestamp(ts, 0).unwrap_or_else(|| Utc::now())
+        });
+        
+        Ok(crate::db::models::UrlWithVisits {
+            url: crate::db::models::UrlRecord {
+                id,
+                url,
+                title,
+                domain,
+                first_seen: Utc::now(), // Not used in this context
+                last_seen: Utc::now(),  // Not used in this context
+            },
+            visit_count: visit_count as usize,
+            last_visit,
+        })
+    })?;
+    
+    let mut urls = Vec::new();
+    for url_result in url_iter {
+        urls.push(url_result?);
+    }
+    
+    Ok(urls)
+}
